@@ -553,8 +553,24 @@ OdinANNIndexNode<DataType>::Search(const DataSetPtr dataset, std::unique_ptr<Con
 
     std::vector<folly::Future<folly::Unit>> futures;
     futures.reserve(nq);
-    // use mem_L provided in search config, default to 40 when not set
-    uint32_t mem_L = search_conf.mem_L.has_value() ? static_cast<uint32_t>(search_conf.mem_L.value()) : 40u;
+    
+    // Determine mem_L: use config value if mem_index is ready, otherwise force to 0
+    uint32_t mem_L;
+    {
+        std::lock_guard<std::mutex> lock(g_mem_index_lock);
+        if (g_mem_index_building || g_mem_index_path.empty()) {
+            // mem_index not yet ready (still building or never built)
+            // Force mem_L to 0 to avoid reading uninitialized memory
+            mem_L = 0;
+            if (search_conf.mem_L.has_value() && search_conf.mem_L.value() > 0) {
+                LOG_KNOWHERE_WARNING_ << "mem_index not ready yet. Forcing mem_L from " 
+                                      << search_conf.mem_L.value() << " to 0 for safety.";
+            }
+        } else {
+            // mem_index is ready, use configured mem_L value, default to 40
+            mem_L = search_conf.mem_L.has_value() ? static_cast<uint32_t>(search_conf.mem_L.value()) : 40u;
+        }
+    }
     for (int64_t row = 0; row < nq; ++row) {
         futures.emplace_back(
             search_pool_->push([this, index = row, k, beamwidth, lsearch, dim, xq, mem_L, p_id_ptr = p_id.get(),
