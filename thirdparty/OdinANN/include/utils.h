@@ -22,12 +22,18 @@ typedef int FileHandle;
 // taken from
 // https://github.com/Microsoft/BLAS-on-flash/blob/master/include/utils.h
 // round up X to the nearest multiple of Y
+#ifndef ROUND_UP
 #define ROUND_UP(X, Y) ((((uint64_t) (X) / (Y)) + ((uint64_t) (X) % (Y) != 0)) * (Y))
+#endif
 
+#ifndef DIV_ROUND_UP
 #define DIV_ROUND_UP(X, Y) (((uint64_t) (X) / (Y)) + ((uint64_t) (X) % (Y) != 0))
+#endif
 
 // round down X to the nearest multiple of Y
+#ifndef ROUND_DOWN
 #define ROUND_DOWN(X, Y) (((uint64_t) (X) / (Y)) * (Y))
+#endif
 
 // alignment tests
 #define IS_ALIGNED(X, Y) ((uint64_t) (X) % (uint64_t) (Y) == 0)
@@ -52,7 +58,8 @@ inline void crash() {
   // #endif
 }
 
-static inline bool file_exists(const std::string &name, bool dirCheck = false) {
+namespace pipeann {
+inline bool file_exists(const std::string &name, bool dirCheck = false) {
   int val;
   struct stat buffer;
   val = stat(name.c_str(), &buffer);
@@ -76,6 +83,7 @@ static inline bool file_exists(const std::string &name, bool dirCheck = false) {
     return dirCheck ? buffer.st_mode & S_IFDIR : true;
   }
 }
+
 
 inline void open_file_to_write(std::ofstream &writer, const std::string &filename) {
   writer.exceptions(std::ofstream::failbit | std::ofstream::badbit);
@@ -115,7 +123,6 @@ inline int delete_file(const std::string &fileName) {
   }
 }
 
-namespace pipeann {
   static const size_t MAX_SIZE_OF_STREAMBUF = 2LL * 1024 * 1024 * 1024;
 
   enum Metric { L2 = 0, INNER_PRODUCT = 1, FAST_L2 = 2, PQ = 3, COSINE = 4 };
@@ -483,27 +490,8 @@ namespace pipeann {
 
   void normalize_data_file(const std::string &inFileName, const std::string &outFileName);
 
-  template<typename T>
-  Distance<T> *get_distance_function(Metric m);
-}  // namespace pipeann
-
-struct PivotContainer {
-  PivotContainer() = default;
-
-  PivotContainer(size_t pivo_id, float pivo_dist) : piv_id{pivo_id}, piv_dist{pivo_dist} {
-  }
-
-  bool operator<(const PivotContainer &p) const {
-    return p.piv_dist < piv_dist;
-  }
-
-  bool operator>(const PivotContainer &p) const {
-    return p.piv_dist > piv_dist;
-  }
-
-  size_t piv_id;
-  float piv_dist;
-};
-
+// The rest of the file content remains unchanged...
 template<typename T>
 pipeann::Distance<T> *get_distance_function(pipeann::Metric m);
+
+};  // namespace pipeann

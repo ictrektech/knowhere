@@ -1,3 +1,5 @@
+#include <cstring>
+
 #ifndef USE_AIO
 #include "linux_aligned_file_reader.h"
 
@@ -11,43 +13,46 @@
 #define MAX_EVENTS 256
 
 namespace {
-  constexpr uint64_t kNoUserData = 0;
-  void execute_io(void *context, int fd, std::vector<IORequest> &reqs, uint64_t n_retries = 0, bool write = false) {
-    io_uring *ring = (io_uring *) context;
-    while (true) {
-      for (uint64_t j = 0; j < reqs.size(); j++) {
-        auto sqe = io_uring_get_sqe(ring);
-        sqe->user_data = kNoUserData;
-        if (write) {
-          io_uring_prep_write(sqe, fd, reqs[j].buf, reqs[j].len, reqs[j].offset);
-        } else {
-          io_uring_prep_read(sqe, fd, reqs[j].buf, reqs[j].len, reqs[j].offset);
-        }
-      }
-      io_uring_submit(ring);
 
-      io_uring_cqe *cqe = nullptr;
-      bool fail = false;
-      for (uint64_t j = 0; j < reqs.size(); j++) {
-        int ret = 0;
-        do {
-          ret = io_uring_wait_cqe(ring, &cqe);
-        } while (ret == -EINTR);
-
-        if (ret < 0 || cqe->res < 0) {
-          fail = true;
-          LOG(ERROR) << "Failed " << strerror(-ret) << " " << ring << " " << j << " " << reqs[j].buf << " "
-                     << reqs[j].len << " " << reqs[j].offset;
-          break;  // CQE broken.
-        }
-        io_uring_cqe_seen(ring, cqe);
-      }
-      if (!fail) {  // repeat until no fails.
-        break;
+constexpr uint64_t kNoUserData = 0;
+void execute_io(void *context, int fd, std::vector<IORequest> &reqs, uint64_t n_retries = 0, bool write = false) {
+  io_uring *ring = (io_uring *) context;
+  while (true) {
+    for (uint64_t j = 0; j < reqs.size(); j++) {
+      auto sqe = io_uring_get_sqe(ring);
+      sqe->user_data = kNoUserData;
+      if (write) {
+        io_uring_prep_write(sqe, fd, reqs[j].buf, reqs[j].len, reqs[j].offset);
+      } else {
+        io_uring_prep_read(sqe, fd, reqs[j].buf, reqs[j].len, reqs[j].offset);
       }
     }
+    io_uring_submit(ring);
+
+    io_uring_cqe *cqe = nullptr;
+    bool fail = false;
+    for (uint64_t j = 0; j < reqs.size(); j++) {
+      int ret = 0;
+      do {
+        ret = io_uring_wait_cqe(ring, &cqe);
+      } while (ret == -EINTR);
+
+      if (ret < 0 || cqe->res < 0) {
+        fail = true;
+        LOG(ERROR) << "Failed " << strerror(-ret) << " " << ring << " " << j << " " << reqs[j].buf << " "
+                   << reqs[j].len << " " << reqs[j].offset;
+        break;  // CQE broken.
+      }
+      io_uring_cqe_seen(ring, cqe);
+    }
+    if (!fail) {  // repeat until no fails.
+      break;
+    }
   }
+}
 }  // namespace
+
+namespace pipeann {
 
 LinuxAlignedFileReader::LinuxAlignedFileReader() {
   this->file_desc = -1;
@@ -71,7 +76,7 @@ LinuxAlignedFileReader::~LinuxAlignedFileReader() {
 }
 
 namespace ioctx {
-  static thread_local io_uring *ring = nullptr;
+static thread_local io_uring *ring = nullptr;
 };
 
 void *LinuxAlignedFileReader::get_ctx(int flag) {
@@ -98,7 +103,7 @@ void LinuxAlignedFileReader::deregister_all_threads() {
   return;
 }
 
-void LinuxAlignedFileReader::open(const std::string &fname, bool enable_writes = false, bool enable_create = false) {
+void LinuxAlignedFileReader::open(const std::string &fname, bool enable_writes, bool enable_create) {
   int flags = O_DIRECT | O_LARGEFILE | O_RDWR;
   if (enable_create) {
     flags |= O_CREAT;
@@ -242,59 +247,62 @@ void LinuxAlignedFileReader::poll_wait(void *ctx) {
 #define MAX_EVENTS 256
 
 namespace {
-  typedef struct io_event io_event_t;
-  typedef struct iocb iocb_t;
 
-  void execute_io(void *ctx, int fd, std::vector<IORequest> &reqs, uint64_t n_retries = 0, bool write = false) {
-    // break-up requests into chunks of size MAX_EVENTS each
-    uint64_t n_iters = ROUND_UP(reqs.size(), MAX_EVENTS) / MAX_EVENTS;
-    for (uint64_t iter = 0; iter < n_iters; iter++) {
-      uint64_t n_ops = std::min((uint64_t) reqs.size() - (iter * MAX_EVENTS), (uint64_t) MAX_EVENTS);
-      std::vector<iocb_t *> cbs(n_ops, nullptr);
-      std::vector<io_event_t> evts(n_ops);
-      std::vector<struct iocb> cb(n_ops);
-      for (uint64_t j = 0; j < n_ops; j++) {
-        if (write) {
-          io_prep_pwrite(cb.data() + j, fd, reqs[j + iter * MAX_EVENTS].buf, reqs[j + iter * MAX_EVENTS].len,
-                         reqs[j + iter * MAX_EVENTS].offset);
-        } else {
-          io_prep_pread(cb.data() + j, fd, reqs[j + iter * MAX_EVENTS].buf, reqs[j + iter * MAX_EVENTS].len,
-                        reqs[j + iter * MAX_EVENTS].offset);
-        }
+typedef struct io_event io_event_t;
+typedef struct iocb iocb_t;
+
+void execute_io(void *ctx, int fd, std::vector<IORequest> &reqs, uint64_t n_retries = 0, bool write = false) {
+  // break-up requests into chunks of size MAX_EVENTS each
+  uint64_t n_iters = ROUND_UP(reqs.size(), MAX_EVENTS) / MAX_EVENTS;
+  for (uint64_t iter = 0; iter < n_iters; iter++) {
+    uint64_t n_ops = std::min((uint64_t) reqs.size() - (iter * MAX_EVENTS), (uint64_t) MAX_EVENTS);
+    std::vector<iocb_t *> cbs(n_ops, nullptr);
+    std::vector<io_event_t> evts(n_ops);
+    std::vector<struct iocb> cb(n_ops);
+    for (uint64_t j = 0; j < n_ops; j++) {
+      if (write) {
+        io_prep_pwrite(cb.data() + j, fd, reqs[j + iter * MAX_EVENTS].buf, reqs[j + iter * MAX_EVENTS].len,
+                       reqs[j + iter * MAX_EVENTS].offset);
+      } else {
+        io_prep_pread(cb.data() + j, fd, reqs[j + iter * MAX_EVENTS].buf, reqs[j + iter * MAX_EVENTS].len,
+                      reqs[j + iter * MAX_EVENTS].offset);
       }
+    }
 
-      // initialize `cbs` using `cb` array
-      //
+    // initialize `cbs` using `cb` array
+    //
 
-      for (uint64_t i = 0; i < n_ops; i++) {
-        cbs[i] = cb.data() + i;
-      }
+    for (uint64_t i = 0; i < n_ops; i++) {
+      cbs[i] = cb.data() + i;
+    }
 
-      uint64_t n_tries = 0;
-      while (n_tries <= n_retries) {
-        // issue reads
-        int64_t ret = io_submit((io_context_t) ctx, (int64_t) n_ops, cbs.data());
-        // if requests didn't get accepted
+    uint64_t n_tries = 0;
+    while (n_tries <= n_retries) {
+      // issue reads
+      int64_t ret = io_submit((io_context_t) ctx, (int64_t) n_ops, cbs.data());
+      // if requests didn't get accepted
+      if (ret != (int64_t) n_ops) {
+        LOG(ERROR) << "io_submit() failed; returned " << ret << ", expected=" << n_ops << ", ernno=" << errno << "="
+                   << ::strerror((int) -ret) << ", try #" << n_tries + 1 << " ctx: " << ctx << "\n";
+        exit(-1);
+      } else {
+        // wait on io_getevents
+        ret = io_getevents((io_context_t) ctx, (int64_t) n_ops, (int64_t) n_ops, evts.data(), nullptr);
+        // if requests didn't complete
         if (ret != (int64_t) n_ops) {
-          LOG(ERROR) << "io_submit() failed; returned " << ret << ", expected=" << n_ops << ", ernno=" << errno << "="
-                     << ::strerror((int) -ret) << ", try #" << n_tries + 1 << " ctx: " << ctx << "\n";
+          LOG(ERROR) << "io_getevents() failed; returned " << ret << ", expected=" << n_ops << ", ernno=" << errno
+                     << "=" << ::strerror((int) -ret) << ", try #" << n_tries + 1;
           exit(-1);
         } else {
-          // wait on io_getevents
-          ret = io_getevents((io_context_t) ctx, (int64_t) n_ops, (int64_t) n_ops, evts.data(), nullptr);
-          // if requests didn't complete
-          if (ret != (int64_t) n_ops) {
-            LOG(ERROR) << "io_getevents() failed; returned " << ret << ", expected=" << n_ops << ", ernno=" << errno
-                       << "=" << ::strerror((int) -ret) << ", try #" << n_tries + 1;
-            exit(-1);
-          } else {
-            break;
-          }
+          break;
         }
       }
     }
   }
+}
 }  // namespace
+
+namespace pipeann {
 
 LinuxAlignedFileReader::LinuxAlignedFileReader() {
   this->file_desc = -1;
@@ -318,7 +326,7 @@ LinuxAlignedFileReader::~LinuxAlignedFileReader() {
 }
 
 namespace ioctx {
-  static thread_local io_context_t ctx;
+static thread_local io_context_t ctx;
 };
 
 void *LinuxAlignedFileReader::get_ctx(int flag) {
@@ -344,7 +352,7 @@ void LinuxAlignedFileReader::deregister_thread() {
 void LinuxAlignedFileReader::deregister_all_threads() {
 }
 
-void LinuxAlignedFileReader::open(const std::string &fname, bool enable_writes = false, bool enable_create = false) {
+void LinuxAlignedFileReader::open(const std::string &fname, bool enable_writes, bool enable_create) {
   int flags = O_DIRECT | O_LARGEFILE | O_RDWR;
   if (enable_create) {
     flags |= O_CREAT;
@@ -486,7 +494,7 @@ void LinuxAlignedFileReader::poll_wait(void *ctx) {
 
 int LinuxAlignedFileReader::send_read_no_alloc(IORequest &req, void *ring) {
 #ifndef READ_ONLY_TESTS
-  if (!v2::cache.get(req.offset / SECTOR_LEN, (uint8_t *) req.buf)) {
+  if (!v2::cache.get(req.offset / SECTOR_LEN_ODIN, (uint8_t *) req.buf)) {
     send_io(req, ring, false);
   } else {
     req.finished = true;  // mark as finished for cache miss
@@ -502,10 +510,10 @@ int LinuxAlignedFileReader::send_read_no_alloc(std::vector<IORequest> &reqs, voi
   std::vector<IORequest> disk_read_reqs;
   // fetch from cache.
   for (auto &req : reqs) {
-    if (req.offset % SECTOR_LEN != 0 || req.len != SECTOR_LEN) {
+    if (req.offset % SECTOR_LEN_ODIN != 0 || req.len != SECTOR_LEN_ODIN) {
       LOG(ERROR) << "Unaligned read offset: " << req.offset << ", len: " << req.len;
     }
-    if (!v2::cache.get(req.offset / SECTOR_LEN, (uint8_t *) req.buf)) {
+    if (!v2::cache.get(req.offset / SECTOR_LEN_ODIN, (uint8_t *) req.buf)) {
       disk_read_reqs.push_back(req);
     }
   }
@@ -523,11 +531,11 @@ void LinuxAlignedFileReader::read_alloc(std::vector<IORequest> &read_reqs, void 
 
   // TODO(gh): introduce size_per_io to cache.
   for (auto &req : read_reqs) {
-    if (req.offset % SECTOR_LEN != 0) {
+    if (req.offset % SECTOR_LEN_ODIN != 0) {
       LOG(ERROR) << "Unaligned read offset: " << req.offset << ", len: " << req.len;
       crash();
     }
-    if (!v2::cache.get(req.offset / SECTOR_LEN, (uint8_t *) req.buf, true)) {
+    if (!v2::cache.get(req.offset / SECTOR_LEN_ODIN, (uint8_t *) req.buf, true)) {
       disk_read_reqs.push_back(req);
     }
   }
@@ -535,17 +543,19 @@ void LinuxAlignedFileReader::read_alloc(std::vector<IORequest> &read_reqs, void 
   if (disk_read_reqs.size() > 0) {
     read(disk_read_reqs, ctx);
     for (auto &req : disk_read_reqs) {
-      v2::cache.put(req.offset / SECTOR_LEN, (uint8_t *) req.buf, true);
+      v2::cache.put(req.offset / SECTOR_LEN_ODIN, (uint8_t *) req.buf, true);
     }
   }
 
   // ref.
   if (page_ref != nullptr) {
     for (auto &req : read_reqs) {
-      page_ref->push_back(req.offset / SECTOR_LEN);
+      page_ref->push_back(req.offset / SECTOR_LEN_ODIN);
     }
   }
 #else
   read(read_reqs, ctx);
 #endif
 }
+
+}  // namespace pipeann

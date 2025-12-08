@@ -1,27 +1,33 @@
-#include <math_utils.h>
-#include <omp.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <random>
+#include <set>
+#include <sstream>
 #include <string>
-
-#include "cached_io.h"
-#include "index.h"
-#include "utils.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <tsl/robin_map.h>
 
-#include <cassert>
+#include "tsl/robin_map.h"
+
+#include "cached_io.h"
+#include "math_utils.h"
 #include "partition_and_pq.h"
+#include "utils.h"
+#include "timer.h"
+#include "index.h"
 
 #define MAX_BLOCK_SIZE 16384  // 64MB for 1024-dim float vectors, 2MB for 128-dim uint8 vectors.
 
+namespace pipeann {
+  
 template<typename T>
 void gen_random_slice(const std::string base_file, const std::string output_prefix, double sampling_rate,
                       size_t offset) {
@@ -91,57 +97,86 @@ void gen_random_slice(const std::string data_file, double p_val, std::unique_ptr
   gen_random_slice<T>(data_file, p_val, sampled_ptr, slice_size, ndims);
   sampled_data.reset(sampled_ptr);
 }
+
 template<typename T>
 void gen_random_slice(const std::string data_file, double p_val, float *&sampled_data, size_t &slice_size,
                       size_t &ndims) {
-  size_t npts;
-  uint32_t npts32, ndims32;
+  size_t npts, nd;
+  pipeann::get_bin_metadata(data_file, npts, nd);
+
   std::vector<std::vector<float>> sampled_vectors;
+  sampled_vectors.reserve(npts);
 
-  // amount to read in one shot
-  _u64 read_blk_size = 64 * 1024 * 1024;
-  std::ifstream base_reader(data_file.c_str());
-
-  // metadata: npts, ndims
-  base_reader.read((char *) &npts32, sizeof(unsigned));
-  base_reader.read((char *) &ndims32, sizeof(unsigned));
-  npts = npts32;
-  ndims = ndims32;
-
-  std::unique_ptr<T[]> cur_vector_T = std::make_unique<T[]>(ndims);
+  std::unique_ptr<T[]> cur_vector_T = std::make_unique<T[]>(nd);
   p_val = p_val < 1 ? p_val : 1;
 
   std::random_device rd;  // Will be used to obtain a seed for the random number
-  size_t x = rd();
-  std::mt19937 generator((unsigned) x);
+  size_t             x = rd();
+  std::mt19937       generator((unsigned) x);
   std::uniform_real_distribution<float> distribution(0, 1);
 
+  std::ifstream reader(data_file, std::ios::binary);
+  reader.seekg(2 * sizeof(uint32_t), std::ios::beg);
+
   for (size_t i = 0; i < npts; i++) {
+    reader.read((char *) cur_vector_T.get(), nd * sizeof(T));
     float rnd_val = distribution(generator);
-    if (rnd_val < (float) p_val) {
-      base_reader.read((char *) cur_vector_T.get(), ndims * sizeof(T));
+    if (rnd_val < p_val) {
       std::vector<float> cur_vector_float;
-      for (size_t d = 0; d < ndims; d++)
-        cur_vector_float.push_back(cur_vector_T[d]);
+      cur_vector_float.reserve(nd);
+      for (size_t d = 0; d < nd; d++)
+        cur_vector_float.push_back(float(cur_vector_T[d]));
       sampled_vectors.push_back(cur_vector_float);
-    } else {
-      base_reader.seekg(ndims * sizeof(T), base_reader.cur);  // skip this vector
     }
   }
   slice_size = sampled_vectors.size();
-  if (slice_size == 0) {
-    slice_size = 1;
-    std::vector<float> cur_vector_float(cur_vector_T.get(), cur_vector_T.get() + ndims);
-    sampled_vectors.push_back(cur_vector_float);
-  }
+  ndims = nd;
   sampled_data = new float[slice_size * ndims];
-
   for (size_t i = 0; i < slice_size; i++) {
     for (size_t j = 0; j < ndims; j++) {
       sampled_data[i * ndims + j] = sampled_vectors[i][j];
     }
   }
 }
+
+template<typename T>
+void gen_random_slice(const T *inputdata, size_t npts, size_t ndims, double p_val, float *&sampled_data,
+                      size_t &slice_size) {
+  std::vector<std::vector<float>> sampled_vectors;
+  const T                        *cur_vector_T;
+
+  p_val = p_val < 1 ? p_val : 1;
+
+  std::random_device
+         rd;  // Will be used to obtain a seed for the random number engine
+  size_t x = rd();
+  std::mt19937 generator(
+      (unsigned) x);  // Standard mersenne_twister_engine seeded with rd()
+  std::uniform_real_distribution<float> distribution(0, 1);
+
+  for (size_t i = 0; i < npts; i++) {
+    cur_vector_T = inputdata + ndims * i;
+    float rnd_val = distribution(generator);
+    if (rnd_val < p_val) {
+      std::vector<float> cur_vector_float;
+      cur_vector_float.reserve(ndims);
+      for (size_t d = 0; d < ndims; d++)
+        cur_vector_float.push_back(float(cur_vector_T[d]));
+      sampled_vectors.push_back(cur_vector_float);
+    }
+  }
+  slice_size = sampled_vectors.size();
+  sampled_data = new float[slice_size * ndims];
+  for (size_t i = 0; i < slice_size; i++) {
+    for (size_t j = 0; j < ndims; j++) {
+      sampled_data[i * ndims + j] = sampled_vectors[i][j];
+    }
+  }
+}
+
+} // namespace pipeann
+
+namespace pipeann {
 
 // given training data in train_data of dimensions num_train * dim, generate PQ
 // pivots using k-means algorithm to partition the co-ordinates into
@@ -307,27 +342,29 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train, unsigne
 
   std::vector<size_t> cumul_bytes(5, 0);
   cumul_bytes[0] = METADATA_SIZE;
-  cumul_bytes[1] = cumul_bytes[0] + pipeann::save_bin<float>(pq_pivots_path.c_str(), full_pivot_data.get(),
+  cumul_bytes[1] = cumul_bytes[0] + save_bin<float>(pq_pivots_path.c_str(), full_pivot_data.get(),
                                                              (size_t) num_centers, dim, cumul_bytes[0]);
   cumul_bytes[2] = cumul_bytes[1] +
                    pipeann::save_bin<float>(pq_pivots_path.c_str(), centroid.get(), (size_t) dim, 1, cumul_bytes[1]);
-  cumul_bytes[3] = cumul_bytes[2] + pipeann::save_bin<uint32_t>(pq_pivots_path.c_str(), rearrangement.data(),
+  cumul_bytes[3] = cumul_bytes[2] + save_bin<uint32_t>(pq_pivots_path.c_str(), rearrangement.data(),
                                                                 rearrangement.size(), 1, cumul_bytes[2]);
-  cumul_bytes[4] = cumul_bytes[3] + pipeann::save_bin<uint32_t>(pq_pivots_path.c_str(), chunk_offsets.data(),
+  cumul_bytes[4] = cumul_bytes[3] + save_bin<uint32_t>(pq_pivots_path.c_str(), chunk_offsets.data(),
                                                                 chunk_offsets.size(), 1, cumul_bytes[3]);
-  pipeann::save_bin<_u64>(pq_pivots_path.c_str(), cumul_bytes.data(), cumul_bytes.size(), 1, 0);
+  save_bin<_u64>(pq_pivots_path.c_str(), cumul_bytes.data(), cumul_bytes.size(), 1, 0);
 
   LOG(INFO) << "Saved pq pivot data to " << pq_pivots_path << " of size " << cumul_bytes[cumul_bytes.size() - 1]
             << "B.";
 
   return 0;
 }
+} // namespace pipeann
 
 // streams the base file (data_file), and computes the closest centers in each
 // chunk to generate the compressed data_file and stores it in
 // pq_compressed_vectors_path.
 // If the numbber of centers is < 256, it stores as byte vector, else as 4-byte
 // vector in binary format.
+namespace pipeann {
 template<typename T>
 int generate_pq_data_from_pivots(const std::string data_file, unsigned num_centers, unsigned num_pq_chunks,
                                  std::string pq_pivots_path, std::string pq_compressed_vectors_path, size_t offset) {
@@ -432,7 +469,7 @@ int generate_pq_data_from_pivots(const std::string data_file, unsigned num_cente
     size_t cur_blk_size = end_id - start_id;
 
     base_reader.read((char *) (block_data_T.get()), sizeof(T) * (cur_blk_size * dim));
-    pipeann::convert_types<T, float>(block_data_T.get(), block_data_tmp.get(), cur_blk_size, dim);
+    convert_types<T, float>(block_data_T.get(), block_data_tmp.get(), cur_blk_size, dim);
 
     for (uint64_t p = 0; p < cur_blk_size; p++) {
       for (uint64_t d = 0; d < dim; d++) {
@@ -489,7 +526,7 @@ int generate_pq_data_from_pivots(const std::string data_file, unsigned num_cente
                                    cur_blk_size * num_pq_chunks * sizeof(uint32_t));
     } else {
       std::unique_ptr<uint8_t[]> pVec = std::make_unique<uint8_t[]>(cur_blk_size * num_pq_chunks);
-      pipeann::convert_types<uint32_t, uint8_t>(block_compressed_base.get(), pVec.get(), cur_blk_size, num_pq_chunks);
+      convert_types<uint32_t, uint8_t>(block_compressed_base.get(), pVec.get(), cur_blk_size, num_pq_chunks);
       compressed_file_writer.write((char *) (pVec.get()), cur_blk_size * num_pq_chunks * sizeof(uint8_t));
     }
     // LOG(INFO) << ".done.";
@@ -502,6 +539,7 @@ int generate_pq_data_from_pivots(const std::string data_file, unsigned num_cente
 #endif
   return 0;
 }
+
 
 template<typename T>
 int estimate_cluster_sizes(const std::string data_file, float *pivots, const size_t num_centers, const size_t dim,
@@ -527,7 +565,7 @@ int estimate_cluster_sizes(const std::string data_file, float *pivots, const siz
 
   size_t BLOCK_SIZE = (std::min)((size_t) MAX_BLOCK_SIZE, num_test);
   size_t num_points = 0, num_dim = 0;
-  pipeann::get_bin_metadata(data_file, num_points, num_dim);
+  get_bin_metadata(data_file, num_points, num_dim);
   size_t block_size = num_points <= BLOCK_SIZE ? num_points : BLOCK_SIZE;
   _u32 *block_closest_centers = new _u32[block_size * k_base];
   float *block_data_float;
@@ -563,6 +601,10 @@ int estimate_cluster_sizes(const std::string data_file, float *pivots, const siz
   delete[] block_closest_centers;
   return 0;
 }
+
+} // namespace pipeann
+
+namespace pipeann {
 
 template<typename T>
 int shard_data_into_clusters(const std::string data_file, float *pivots, const size_t num_centers, const size_t dim,
@@ -613,7 +655,7 @@ int shard_data_into_clusters(const std::string data_file, float *pivots, const s
     size_t cur_blk_size = end_id - start_id;
 
     base_reader.read((char *) block_data_T.get(), sizeof(T) * (cur_blk_size * dim));
-    pipeann::convert_types<T, float>(block_data_T.get(), block_data_float.get(), cur_blk_size, dim);
+    convert_types<T, float>(block_data_T.get(), block_data_float.get(), cur_blk_size, dim);
 
     math_utils::compute_closest_centers(block_data_float.get(), cur_blk_size, dim, pivots, num_centers, k_base,
                                         block_closest_centers.get());
@@ -648,27 +690,25 @@ int shard_data_into_clusters(const std::string data_file, float *pivots, const s
   return 0;
 }
 
+
 template<typename T>
-int partition_with_ram_budget(const std::string data_file, const double sampling_rate, double ram_budget,
-                              size_t graph_degree, const std::string prefix_path, size_t k_base) {
+int partition_with_ram_budget(const std::string data_file, double sampling_rate, double ram_budget, size_t graph_degree,
+                             const std::string partition_file, size_t num_parts) {
   size_t train_dim;
   size_t num_train;
   float *train_data_float;
   size_t max_k_means_reps = 20;
 
-  int num_parts = 3;
   bool fit_in_ram = false;
 
   gen_random_slice<T>(data_file, sampling_rate, train_data_float, num_train, train_dim);
 
   float *pivot_data = nullptr;
 
-  std::string cur_file = std::string(prefix_path);
+  std::string cur_file = std::string(partition_file); // 修复变量名：prefix_path -> partition_file
   std::string output_file;
 
   // kmeans_partitioning on training data
-
-  //  cur_file = cur_file + "_kmeans_partitioning-" + std::to_string(num_parts);
   output_file = cur_file + "_centroids.bin";
 
   while (!fit_in_ram) {
@@ -687,11 +727,11 @@ int partition_with_ram_budget(const std::string data_file, const double sampling
 
     // now pivots are ready. need to stream base points and assign them to
     // closest clusters.
-
     std::vector<size_t> cluster_sizes;
-    estimate_cluster_sizes<T>(data_file, pivot_data, num_parts, train_dim, k_base, cluster_sizes);
+    estimate_cluster_sizes<T>(data_file, pivot_data, num_parts, train_dim, graph_degree, cluster_sizes);
 
     for (auto &p : cluster_sizes) {
+      // 直接使用 pipeann 命名空间下的 estimate_ram_usage 函数
       double cur_shard_ram_estimate = pipeann::estimate_ram_usage(p, train_dim, sizeof(T), graph_degree);
 
       if (cur_shard_ram_estimate > max_ram_usage)
@@ -706,62 +746,88 @@ int partition_with_ram_budget(const std::string data_file, const double sampling
   }
 
   LOG(INFO) << "Saving global k-center pivots";
-  pipeann::save_bin<float>(output_file.c_str(), pivot_data, (size_t) num_parts, train_dim);
+  save_bin<float>(output_file.c_str(), pivot_data, (size_t) num_parts, train_dim);
 
-  shard_data_into_clusters<T>(data_file, pivot_data, num_parts, train_dim, k_base, prefix_path);
+  shard_data_into_clusters<T>(data_file, pivot_data, num_parts, train_dim, graph_degree, partition_file);
   delete[] pivot_data;
   delete[] train_data_float;
   return num_parts;
 }
 
-// Instantations of supported templates
-template void gen_random_slice<int8_t>(const std::string data_file, double p_val,
-                                       std::unique_ptr<float[]> &sampled_data, size_t &slice_size, size_t &ndims);
-template void gen_random_slice<uint8_t>(const std::string data_file, double p_val,
-                                        std::unique_ptr<float[]> &sampled_data, size_t &slice_size, size_t &ndims);
-template void gen_random_slice<float>(const std::string data_file, double p_val, std::unique_ptr<float[]> &sampled_data,
-                                      size_t &slice_size, size_t &ndims);
 
-template void gen_random_slice<int8_t>(const std::string base_file, const std::string output_prefix,
+template void gen_random_slice<int8_t>(const std::string base_file, 
+                                       const std::string output_prefix,
                                        double sampling_rate, size_t offset);
-template void gen_random_slice<uint8_t>(const std::string base_file, const std::string output_prefix,
+template void gen_random_slice<uint8_t>(const std::string base_file, 
+                                        const std::string output_prefix,
                                         double sampling_rate, size_t offset);
-template void gen_random_slice<float>(const std::string base_file, const std::string output_prefix,
+template void gen_random_slice<float>(const std::string base_file, 
+                                      const std::string output_prefix,
                                       double sampling_rate, size_t offset);
 
-template void gen_random_slice<float>(const std::string data_file, double p_val, float *&sampled_data,
+// gen_random_slice overloads for (data_file, p_val, float *&, slice_size, ndims)
+template void gen_random_slice<float>(const std::string data_file, double p_val,
+                                      float *&sampled_data,
                                       size_t &slice_size, size_t &ndims);
-template void gen_random_slice<uint8_t>(const std::string data_file, double p_val, float *&sampled_data,
+template void gen_random_slice<uint8_t>(const std::string data_file, double p_val,
+                                        float *&sampled_data,
                                         size_t &slice_size, size_t &ndims);
-template void gen_random_slice<int8_t>(const std::string data_file, double p_val, float *&sampled_data,
+template void gen_random_slice<int8_t>(const std::string data_file, double p_val,
+                                       float *&sampled_data,
                                        size_t &slice_size, size_t &ndims);
 
-template int partition_with_ram_budget<int8_t>(const std::string data_file, const double sampling_rate,
-                                               double ram_budget, size_t graph_degree, const std::string prefix_path,
-                                               size_t k_base);
-template int partition_with_ram_budget<uint8_t>(const std::string data_file, const double sampling_rate,
-                                                double ram_budget, size_t graph_degree, const std::string prefix_path,
-                                                size_t k_base);
+// gen_random_slice overloads for (inputdata, npts, ndims, p_val, sampled_data, slice_size)
+template void gen_random_slice<float>(const float *inputdata, size_t npts,
+                                      size_t ndims, double p_val,
+                                      float *&sampled_data,
+                                      size_t &slice_size);
+template void gen_random_slice<uint8_t>(const uint8_t *inputdata, size_t npts,
+                                        size_t ndims, double p_val,
+                                        float *&sampled_data,
+                                        size_t &slice_size);
+template void gen_random_slice<int8_t>(const int8_t *inputdata, size_t npts,
+                                       size_t ndims, double p_val,
+                                       float *&sampled_data,
+                                       size_t &slice_size); 
 template int partition_with_ram_budget<float>(const std::string data_file, const double sampling_rate,
-                                              double ram_budget, size_t graph_degree, const std::string prefix_path,
-                                              size_t k_base);
+                                              double ram_budget, size_t graph_degree, const std::string partition_file,
+                                              size_t num_parts);
+template int partition_with_ram_budget<int8_t>(const std::string data_file, const double sampling_rate,
+                                               double ram_budget, size_t graph_degree, const std::string partition_file,
+                                               size_t num_parts);
+template int partition_with_ram_budget<uint8_t>(const std::string data_file, const double sampling_rate,
+                                                double ram_budget, size_t graph_degree, const std::string partition_file,
+                                                size_t num_parts);
+} // namespace pipeann
 
-template int generate_pq_pivots<float>(const std::unique_ptr<float[]> &passed_train_data, size_t num_train,
+
+
+
+
+
+template int pipeann::generate_pq_pivots<float>(const std::unique_ptr<float[]> &passed_train_data, size_t num_train,
                                        unsigned dim, unsigned num_centers, unsigned num_pq_chunks,
                                        unsigned max_k_means_reps, std::string pq_pivots_path);
-template int generate_pq_pivots<int8_t>(const std::unique_ptr<int8_t[]> &passed_train_data, size_t num_train,
+template int pipeann::generate_pq_pivots<int8_t>(const std::unique_ptr<int8_t[]> &passed_train_data, size_t num_train,
                                         unsigned dim, unsigned num_centers, unsigned num_pq_chunks,
                                         unsigned max_k_means_reps, std::string pq_pivots_path);
-template int generate_pq_pivots<uint8_t>(const std::unique_ptr<uint8_t[]> &passed_train_data, size_t num_train,
+template int pipeann::generate_pq_pivots<uint8_t>(const std::unique_ptr<uint8_t[]> &passed_train_data, size_t num_train,
                                          unsigned dim, unsigned num_centers, unsigned num_pq_chunks,
                                          unsigned max_k_means_reps, std::string pq_pivots_path);
 
-template int generate_pq_data_from_pivots<int8_t>(const std::string data_file, unsigned num_centers,
-                                                  unsigned num_pq_chunks, std::string pq_pivots_path,
-                                                  std::string pq_compressed_vectors_path, size_t offset);
-template int generate_pq_data_from_pivots<uint8_t>(const std::string data_file, unsigned num_centers,
-                                                   unsigned num_pq_chunks, std::string pq_pivots_path,
-                                                   std::string pq_compressed_vectors_path, size_t offset);
-template int generate_pq_data_from_pivots<float>(const std::string data_file, unsigned num_centers,
-                                                 unsigned num_pq_chunks, std::string pq_pivots_path,
-                                                 std::string pq_compressed_vectors_path, size_t offset);
+template int pipeann::estimate_cluster_sizes<int8_t>(const std::string data_file, float *pivots, const size_t num_centers, const size_t dim,
+                            const size_t k_base, std::vector<size_t> &cluster_sizes);
+template int pipeann::estimate_cluster_sizes<uint8_t>(const std::string data_file, float *pivots, const size_t num_centers, const size_t dim,
+                             const size_t k_base, std::vector<size_t> &cluster_sizes);
+template int pipeann::estimate_cluster_sizes<float>(const std::string data_file, float *pivots, const size_t num_centers, const size_t dim,
+                            const size_t k_base, std::vector<size_t> &cluster_sizes);
+
+template int pipeann::generate_pq_data_from_pivots<int8_t>(const std::string data_file, unsigned num_centers,
+                                                           unsigned num_pq_chunks, std::string pq_pivots_path,
+                                                           std::string pq_compressed_vectors_path, size_t offset);
+template int pipeann::generate_pq_data_from_pivots<uint8_t>(const std::string data_file, unsigned num_centers,
+                                                            unsigned num_pq_chunks, std::string pq_pivots_path,
+                                                            std::string pq_compressed_vectors_path, size_t offset);
+template int pipeann::generate_pq_data_from_pivots<float>(const std::string data_file, unsigned num_centers,
+                                                          unsigned num_pq_chunks, std::string pq_pivots_path,
+                                                          std::string pq_compressed_vectors_path, size_t offset);

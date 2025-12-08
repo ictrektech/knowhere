@@ -3,6 +3,7 @@
 #include "aligned_file_reader.h"
 #include "v2/lock_table.h"
 
+namespace pipeann {
 class LinuxAlignedFileReader : public AlignedFileReader {
  private:
   uint64_t file_sz;
@@ -47,13 +48,14 @@ class LinuxAlignedFileReader : public AlignedFileReader {
 
   void deregister_all_threads();
 };
+} // namespace pipeann
 
 namespace v2 {
   inline std::vector<uint64_t> lockReqs(SparseLockTable<uint64_t> &lock_table, std::vector<IORequest> &reqs) {
     std::vector<uint64_t> ret;
     for (auto &req : reqs) {
-      for (uint64_t i = 0; i < req.len; i += SECTOR_LEN) {
-        ret.push_back((req.offset + i) / SECTOR_LEN);
+      for (uint64_t i = 0; i < req.len; i += SECTOR_LEN_ODIN) {
+        ret.push_back((req.offset + i) / SECTOR_LEN_ODIN);
       }
     }
     std::sort(ret.begin(), ret.end());
@@ -69,4 +71,4 @@ namespace v2 {
       lock_table.unlock(x);
     }
   }
-};  // namespace v2
+}  // namespace v2

@@ -383,7 +383,7 @@ namespace pipeann {
   template class SSDIndex<float>;
   template class SSDIndex<_s8>;
   template class SSDIndex<_u8>;
-  
+
   // 添加针对knowhere特定类型的模板实例化
 #ifdef KNOWHERE_WITH_ODINANN
   template class SSDIndex<knowhere::fp16>;

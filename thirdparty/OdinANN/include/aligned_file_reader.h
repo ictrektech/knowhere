@@ -10,6 +10,8 @@
 #include <malloc.h>
 #include <cstdio>
 
+namespace pipeann {
+
 class AlignedFileReader {
  public:
   // returns the thread-specific io ring.
@@ -42,15 +44,15 @@ class AlignedFileReader {
   inline void wbc_write(std::vector<IORequest> &write_reqs, void *ctx, std::vector<uint64_t> *page_ref = nullptr) {
     // auto locked_reqs = v2::lockReqs(v2::cache.lock_table, write_reqs);
     for (auto &req : write_reqs) {
-      for (uint64_t i = 0; i < req.len; i += SECTOR_LEN) {
-        v2::cache.put((req.offset + i) / SECTOR_LEN, (uint8_t *) req.buf + i, true);
+      for (uint64_t i = 0; i < req.len; i += SECTOR_LEN_ODIN) {
+        v2::cache.put((req.offset + i) / SECTOR_LEN_ODIN, (uint8_t *) req.buf + i, true);
       }
     }
     // v2::unlockReqs(v2::cache.lock_table, locked_reqs);
     if (page_ref != nullptr) {
       for (auto &req : write_reqs) {
-        for (uint64_t i = 0; i < req.len; i += SECTOR_LEN) {
-          page_ref->push_back((req.offset + i) / SECTOR_LEN);
+        for (uint64_t i = 0; i < req.len; i += SECTOR_LEN_ODIN) {
+          page_ref->push_back((req.offset + i) / SECTOR_LEN_ODIN);
         }
       }
     }
@@ -82,3 +84,5 @@ class AlignedFileReader {
   virtual void deregister_thread() = 0;
   virtual void deregister_all_threads() = 0;
 };
+
+} // namespace pipeann
